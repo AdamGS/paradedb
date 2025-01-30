@@ -16,7 +16,6 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use pgrx::{pg_sys::ItemPointerData, *};
-use tantivy::Term;
 
 use super::storage::block::CLEANUP_LOCK;
 use crate::index::fast_fields_helper::FFType;
@@ -27,24 +26,24 @@ use crate::index::{BlockDirectoryType, WriterResources};
 use crate::postgres::storage::buffer::BufferManager;
 
 #[pg_guard]
-pub extern "C" fn ambulkdelete(
+pub unsafe extern "C" fn ambulkdelete(
     info: *mut pg_sys::IndexVacuumInfo,
     stats: *mut pg_sys::IndexBulkDeleteResult,
     callback: pg_sys::IndexBulkDeleteCallback,
     callback_state: *mut ::std::os::raw::c_void,
 ) -> *mut pg_sys::IndexBulkDeleteResult {
-    let info = unsafe { PgBox::from_pg(info) };
-    let mut stats = unsafe { PgBox::from_pg(stats) };
-    let index_relation = unsafe { PgRelation::from_pg(info.index) };
+    let info = PgBox::from_pg(info);
+    let mut stats = PgBox::from_pg(stats);
+    let index_relation = PgRelation::from_pg(info.index);
     let callback =
         callback.expect("the ambulkdelete() callback should be a valid function pointer");
-    let callback = move |ctid_val: u64| unsafe {
+    let callback = move |ctid_val: u64| {
         let mut ctid = ItemPointerData::default();
         crate::postgres::utils::u64_to_item_pointer(ctid_val, &mut ctid);
         callback(&mut ctid, callback_state)
     };
 
-    let merge_lock = unsafe { MergeLock::acquire_for_delete(index_relation.oid()) };
+    let merge_lock = MergeLock::acquire_for_delete(index_relation.oid());
     let mut writer = SearchIndexWriter::open(
         &index_relation,
         BlockDirectoryType::BulkDelete,
@@ -54,24 +53,38 @@ pub extern "C" fn ambulkdelete(
     let reader = SearchIndexReader::open(&index_relation, BlockDirectoryType::BulkDelete, false)
         .expect("ambulkdelete: should be able to open a SearchIndexReader");
 
-    let ctid_field = writer.get_ctid_field();
+    let writer_ids = writer.segment_ids();
+
     let mut did_delete = false;
 
     for segment_reader in reader.searcher().segment_readers() {
+        if !writer_ids.contains(&segment_reader.segment_id()) {
+            // the writer doesn't have this segment reader, and that's fine
+            // we open the writer and reader in separate calls so it's possible
+            // for the reader, which is opened second, to see a different view of
+            // the segment entries on disk, but we only need to concern ourselves with
+            // the ones the writer is aware of
+            continue;
+        }
         let ctid_ff = FFType::new_ctid(segment_reader.fast_fields());
 
         for doc_id in 0..segment_reader.max_doc() {
-            check_for_interrupts!();
+            if doc_id % 100 == 0 {
+                // we think there's a pending interrupt, so this should raise a cancel query ERROR
+                pg_sys::vacuum_delay_point();
+            }
+
             let ctid = ctid_ff.as_u64(doc_id).expect("ctid should be present");
             if callback(ctid) {
                 did_delete = true;
                 writer
-                    .delete_term(Term::from_field_u64(ctid_field, ctid))
-                    .expect("ambulkdelete: deleting ctid Term should succeed");
+                    .delete_document(segment_reader.segment_id(), doc_id)
+                    .expect("ambulkdelete: deleting document by segment and id should succeed");
             }
         }
     }
-    // Don't merge here, amvacuumcleanup will merge
+
+    // this won't merge as the `WriterResources::Vacuum` uses `AllowedMergePolicy::None`
     writer
         .commit()
         .expect("ambulkdelete: commit should succeed");

@@ -17,10 +17,11 @@
 
 use anyhow::Result;
 use pgrx::PgRelation;
-use std::sync::Arc;
+use std::collections::HashSet;
+use tantivy::index::SegmentId;
 use tantivy::indexer::UserOperation;
 use tantivy::schema::Field;
-use tantivy::{Index, IndexSettings, IndexWriter, Opstamp, TantivyDocument, TantivyError, Term};
+use tantivy::{DocId, Index, IndexSettings, IndexWriter, Opstamp, TantivyDocument, TantivyError};
 use thiserror::Error;
 
 use crate::index::channel::{ChannelDirectory, ChannelRequestHandler};
@@ -42,7 +43,7 @@ pub struct SearchIndexWriter {
 
     // keep all these private -- leaking them to the public API would allow callers to
     // mis-use the IndexWriter in particular.
-    writer: Arc<IndexWriter>,
+    writer: Option<IndexWriter>,
     handler: ChannelRequestHandler,
     insert_queue: Vec<UserOperation>,
 }
@@ -83,7 +84,7 @@ impl SearchIndexWriter {
         let ctid_field = schema.schema.get_field("ctid")?;
 
         Ok(Self {
-            writer: Arc::new(writer),
+            writer: Some(writer),
             schema,
             handler,
             ctid_field,
@@ -128,7 +129,7 @@ impl SearchIndexWriter {
         let ctid_field = schema.schema.get_field("ctid")?;
 
         Ok(Self {
-            writer: Arc::new(writer),
+            writer: Some(writer),
             schema,
             ctid_field,
             handler,
@@ -136,12 +137,18 @@ impl SearchIndexWriter {
         })
     }
 
-    pub fn get_ctid_field(&self) -> Field {
-        self.ctid_field
+    pub fn segment_ids(&mut self) -> HashSet<SegmentId> {
+        let index = self.writer.as_ref().unwrap().index().clone();
+        self.handler
+            .wait_for(move || index.searchable_segment_ids().unwrap())
+            .unwrap()
+            .into_iter()
+            .collect()
     }
 
-    pub fn delete_term(&mut self, term: Term) -> Result<()> {
-        self.insert_queue.push(UserOperation::Delete(term));
+    pub fn delete_document(&mut self, segment_id: SegmentId, doc_id: DocId) -> Result<()> {
+        self.insert_queue
+            .push(UserOperation::DeleteByAddress(segment_id, doc_id));
         if self.insert_queue.len() >= MAX_INSERT_QUEUE_SIZE {
             self.drain_insert_queue()?;
         }
@@ -163,8 +170,7 @@ impl SearchIndexWriter {
 
     pub fn commit(mut self) -> Result<()> {
         self.drain_insert_queue()?;
-        let mut writer =
-            Arc::into_inner(self.writer).expect("should not have an outstanding Arc<IndexWriter>");
+        let mut writer = self.writer.take().expect("IndexWriter should be set");
 
         self.handler
             .wait_for(move || {
@@ -179,10 +185,13 @@ impl SearchIndexWriter {
 
     fn drain_insert_queue(&mut self) -> Result<Opstamp, TantivyError> {
         let insert_queue = std::mem::take(&mut self.insert_queue);
-        let writer = self.writer.clone();
-        self.handler
-            .wait_for(move || writer.run(insert_queue))
-            .expect("spawned thread should not fail")
+
+        // this doesn't need to go through `self.handler.wait_for(|| ...)` because
+        // the `.run()` function doesn't do anything involving the Directory
+        self.writer
+            .as_ref()
+            .expect("IndexWriter should be set")
+            .run(insert_queue)
     }
 }
 

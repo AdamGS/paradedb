@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Formatter};
 use std::hash::Hash;
 use std::mem::{offset_of, size_of};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::slice::from_raw_parts;
 use tantivy::index::{SegmentComponent, SegmentId};
 use tantivy::Opstamp;
@@ -173,6 +173,64 @@ impl Default for SegmentMetaEntry {
     }
 }
 
+impl SegmentMetaEntry {
+    pub fn num_docs(&self) -> usize {
+        self.max_doc as usize - self.num_deleted_docs()
+    }
+
+    pub fn num_deleted_docs(&self) -> usize {
+        self.delete
+            .map(|entry| entry.num_deleted_docs as usize)
+            .unwrap_or(0)
+    }
+
+    pub fn byte_size(&self) -> u64 {
+        let mut size = 0;
+
+        size += self
+            .postings
+            .as_ref()
+            .map(|entry| entry.total_bytes as u64)
+            .unwrap_or(0);
+        size += self
+            .positions
+            .as_ref()
+            .map(|entry| entry.total_bytes as u64)
+            .unwrap_or(0);
+        size += self
+            .fast_fields
+            .as_ref()
+            .map(|entry| entry.total_bytes as u64)
+            .unwrap_or(0);
+        size += self
+            .field_norms
+            .as_ref()
+            .map(|entry| entry.total_bytes as u64)
+            .unwrap_or(0);
+        size += self
+            .terms
+            .as_ref()
+            .map(|entry| entry.total_bytes as u64)
+            .unwrap_or(0);
+        size += self
+            .store
+            .as_ref()
+            .map(|entry| entry.total_bytes as u64)
+            .unwrap_or(0);
+        size += self
+            .temp_store
+            .as_ref()
+            .map(|entry| entry.total_bytes as u64)
+            .unwrap_or(0);
+        size += self
+            .delete
+            .as_ref()
+            .map(|entry| entry.file_entry.total_bytes as u64)
+            .unwrap_or(0);
+        size
+    }
+}
+
 // ---------------------------------------------------------
 // Linked list entry <-> PgItem
 // ---------------------------------------------------------
@@ -221,70 +279,6 @@ impl SegmentMetaEntry {
             SegmentComponent::TempStore => self.temp_store,
             SegmentComponent::Delete => self.delete.map(|entry| entry.file_entry),
         }
-    }
-
-    pub fn get_component_paths(&self) -> Vec<PathBuf> {
-        let mut paths = Vec::with_capacity(8);
-
-        let uuid = self.segment_id.uuid_string();
-        if self.postings.is_some() {
-            paths.push(PathBuf::from(format!(
-                "{}.{}",
-                uuid,
-                SegmentComponent::Postings
-            )));
-        }
-        if self.positions.is_some() {
-            paths.push(PathBuf::from(format!(
-                "{}.{}",
-                uuid,
-                SegmentComponent::Positions
-            )));
-        }
-        if self.fast_fields.is_some() {
-            paths.push(PathBuf::from(format!(
-                "{}.{}",
-                uuid,
-                SegmentComponent::FastFields
-            )));
-        }
-        if self.field_norms.is_some() {
-            paths.push(PathBuf::from(format!(
-                "{}.{}",
-                uuid,
-                SegmentComponent::FieldNorms
-            )));
-        }
-        if self.terms.is_some() {
-            paths.push(PathBuf::from(format!(
-                "{}.{}",
-                uuid,
-                SegmentComponent::Terms
-            )));
-        }
-        if self.store.is_some() {
-            paths.push(PathBuf::from(format!(
-                "{}.{}",
-                uuid,
-                SegmentComponent::Store
-            )));
-        }
-        if self.temp_store.is_some() {
-            paths.push(PathBuf::from(format!(
-                "{}.{}",
-                uuid,
-                SegmentComponent::TempStore
-            )));
-        }
-        if let Some(_entry) = &self.delete {
-            paths.push(PathBuf::from(format!(
-                "{}.0.{}", // we can hardcode zero as the opstamp component of the path as it's not used by anyone
-                uuid,
-                SegmentComponent::Delete
-            )));
-        }
-
-        paths
     }
 }
 
