@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::future::ready;
 use std::{io::Write, sync::Arc};
 
 use async_trait::async_trait;
@@ -12,7 +13,9 @@ use object_store::{
 use object_store::{GetRange, PutMode};
 use pgrx::pg_sys::Oid;
 use rustc_hash::FxHashMap;
+use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
+use vortex::io::{VortexReadAt, VortexWrite};
 
 use crate::postgres::storage::block::FileEntry;
 use crate::postgres::storage::{linked_bytes::RangeData, LinkedBytesList};
@@ -27,6 +30,89 @@ struct BlockObjectStore {
 impl std::fmt::Display for BlockObjectStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "BlockObjectStore")
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BlockReader {
+    entry: FileEntry,
+    oid: Oid,
+}
+
+impl VortexReadAt for BlockReader {
+    fn read_byte_range(
+        &self,
+        pos: u64,
+        len: u64,
+    ) -> impl std::future::Future<Output = std::io::Result<Bytes>> + 'static {
+        let oid = self.oid;
+        let block = self.entry.staring_block;
+        async move {
+            let pos = pos as usize;
+            let len = len as usize;
+            let end = pos + len;
+            let linked_bytes_list = LinkedBytesList::open(oid, block);
+            let data = unsafe { linked_bytes_list.get_bytes_range(pos..end) };
+
+            let data = if matches!(data, RangeData::OnePage(_, _)) {
+                Bytes::copy_from_slice(&*data)
+            } else if let RangeData::MultiPage(vec) = data {
+                Bytes::from(vec)
+            } else {
+                unreachable!()
+            };
+
+            Ok(data)
+        }
+    }
+
+    fn size(&self) -> impl std::future::Future<Output = std::io::Result<u64>> + 'static {
+        ready(Ok(self.entry.total_bytes as u64))
+    }
+}
+
+struct BlockWriter {
+    entry: FileEntry,
+    oid: Oid,
+    linked_bytes_list: LinkedBytesList,
+}
+
+impl BlockWriter {
+    fn new(relation_oid: Oid) -> Self {
+        let linked_bytes_list = unsafe { LinkedBytesList::create(relation_oid) };
+        let entry = FileEntry {
+            staring_block: linked_bytes_list.header_blockno,
+            total_bytes: 0,
+        };
+        Self {
+            oid: relation_oid,
+            linked_bytes_list,
+            entry,
+        }
+    }
+}
+
+impl VortexWrite for BlockWriter {
+    fn write_all<B: vortex::io::IoBuf>(
+        &mut self,
+        buffer: B,
+    ) -> impl std::future::Future<Output = std::io::Result<B>> {
+        async move {
+            let bytes = buffer.as_slice();
+            self.linked_bytes_list.write_all(buffer.as_slice())?;
+            self.linked_bytes_list.flush()?;
+            self.entry.total_bytes += bytes.len();
+
+            Ok(buffer)
+        }
+    }
+
+    fn flush(&mut self) -> impl std::future::Future<Output = std::io::Result<()>> {
+        async { self.linked_bytes_list.flush() }
+    }
+
+    fn shutdown(&mut self) -> impl std::future::Future<Output = std::io::Result<()>> {
+        ready(Ok(()))
     }
 }
 
@@ -54,6 +140,13 @@ impl ObjectStore for BlockObjectStore {
                     source: Box::new(source),
                 })?;
         }
+
+        linked_bytes_list
+            .flush()
+            .map_err(|source| object_store::Error::Generic {
+                store: "BlockObjectStore",
+                source: Box::new(source),
+            })?;
 
         self.inner.lock().await.insert(
             location.clone(),
@@ -203,14 +296,65 @@ impl ObjectStore for BlockObjectStore {
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::pg_schema]
 mod tests {
-    use datafusion::{execution::object_store::ObjectStoreUrl, prelude::SessionContext};
+    use datafusion::{
+        execution::{object_store::ObjectStoreUrl, SessionState, SessionStateBuilder},
+        prelude::SessionContext,
+    };
     use pgrx::{pg_sys, pg_test, Spi};
-    use tokio::runtime::Runtime;
+    use vortex::{
+        array::PrimitiveArray,
+        file::{ExecutionMode, Scan, VortexOpenOptions, VortexWriteOptions},
+        sampling_compressor::ALL_ENCODINGS_CONTEXT,
+        IntoArray,
+    };
 
     use super::*;
 
     #[pg_test]
-    fn datafusion_example() -> anyhow::Result<()> {
+    fn plain_vortex_example() -> anyhow::Result<()> {
+        Spi::run("CREATE TABLE t (id SERIAL, data TEXT);")?;
+        Spi::run("CREATE INDEX t_idx ON t USING bm25(id, data) WITH (key_field = 'id')")?;
+        let relation_oid: pg_sys::Oid =
+            Spi::get_one("SELECT oid FROM pg_class WHERE relname = 't_idx' AND relkind = 'i';")
+                .expect("spi should succeed")
+                .unwrap();
+
+        tokio::runtime::Builder::new_current_thread()
+            .build()?
+            .block_on(async move {
+                let array = PrimitiveArray::from_iter(vec![1, 2, 3]).into_array();
+                let writer = BlockWriter::new(relation_oid);
+
+                let writer = VortexWriteOptions::default()
+                    .write(writer, array.into_array_stream())
+                    .await?;
+
+                let reader = BlockReader {
+                    oid: writer.oid,
+                    entry: writer.entry,
+                };
+
+                let reader_stream = VortexOpenOptions::new(ALL_ENCODINGS_CONTEXT.clone())
+                    .with_execution_mode(ExecutionMode::Inline)
+                    .open(reader)
+                    .await?;
+
+                let mut stream = Box::pin(reader_stream.scan(Scan::all())?);
+                let mut total_len = 0;
+
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk?;
+                    total_len += chunk.len();
+                }
+
+                assert_eq!(total_len, 3);
+
+                anyhow::Ok(())
+            })
+    }
+
+    #[pg_test]
+    fn vortex_datafusion_example() -> anyhow::Result<()> {
         // obviously just a hack to get a oid
         Spi::run("CREATE TABLE t (id SERIAL, data TEXT);")?;
         Spi::run("CREATE INDEX t_idx ON t USING bm25(id, data) WITH (key_field = 'id')")?;
@@ -219,30 +363,33 @@ mod tests {
                 .expect("spi should succeed")
                 .unwrap();
 
-        _ = Runtime::new()?.block_on(async move {
-            let object_store = Arc::new(BlockObjectStore {
-                inner: Default::default(),
-                relation_oid,
-            });
+        tokio::runtime::Builder::new_current_thread()
+            .build()?
+            .block_on(async move {
+                let object_store = Arc::new(BlockObjectStore {
+                    inner: Default::default(),
+                    relation_oid,
+                });
 
-            let url = ObjectStoreUrl::parse("file://")?;
-            let session = SessionContext::new();
-            _ = session.register_object_store(url.as_ref(), object_store);
+                let url = ObjectStoreUrl::parse("file://")?;
 
-            let _df = session
-                .sql(
-                    "CREATE EXTERNAL TABLE tbl
+                // Missing a piece that will be in tomorrow's (January 31st) Vortex release
+                // let state = SessionStateBuilder::new().with_file_formats(file_formats)
+                let session = SessionContext::new();
+                _ = session.register_object_store(url.as_ref(), object_store);
+
+                let _df = session
+                    .sql(
+                        "CREATE EXTERNAL TABLE tbl
                     STORED AS VORTEX
                     LOCATION '/path/to/data';",
-                )
-                .await?;
+                    )
+                    .await?;
 
-            // TODO: insert some data
-            // TODO: hopefully query it back
+                // TODO: insert some data
+                // TODO: hopefully query it back
 
-            anyhow::Ok(())
-        });
-
-        Ok(())
+                anyhow::Ok(())
+            })
     }
 }
