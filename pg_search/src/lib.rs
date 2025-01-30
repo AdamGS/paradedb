@@ -28,6 +28,9 @@ pub mod github;
 pub mod gucs;
 pub mod telemetry;
 
+#[cfg(feature = "vortex")]
+mod vortex;
+
 use self::postgres::customscan;
 use pgrx::*;
 use telemetry::setup_telemetry_background_worker;
